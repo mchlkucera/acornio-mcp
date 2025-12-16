@@ -370,11 +370,17 @@ export async function POST(request: Request) {
   return toFetchResponse(res);
 }
 
-export async function GET(request: Request) {
-  await ensureConnected();
-  const { req, res } = toReqRes(request);
-  await transport.handleRequest(req, res);
-  return toFetchResponse(res);
+export async function GET() {
+  // SSE streams not supported in stateless mode - return 405
+  // Cursor will still work, it just won't get server-initiated notifications
+  return new Response(JSON.stringify({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'SSE not supported in stateless mode' },
+    id: null,
+  }), {
+    status: 405,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 export async function DELETE() {
