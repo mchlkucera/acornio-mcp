@@ -1,19 +1,24 @@
-import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { toFetchResponse, toReqRes } from 'fetch-to-node';
 import { z } from 'zod';
 
-// Store transports and servers by session ID for stateful connections
-const transports = new Map<string, WebStandardStreamableHTTPServerTransport>();
-const servers = new Map<string, McpServer>();
+// ═══════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+const GITHUB_API_BASE = 'https://api.github.com';
+const GITHUB_RAW_BASE = 'https://raw.githubusercontent.com';
+const GITHUB_API_VERSION = 'application/vnd.github.v3+json';
+const USER_AGENT = 'MCP-Knowledge-Server';
+const MARKDOWN_EXTENSION = '.md';
+
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // KNOWLEDGE BASE CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-// GitHub token for higher API rate limits (60/hr → 5000/hr)
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-
-// Knowledge base repositories
 const KNOWLEDGE_BASES = [
   {
     id: 'vision',
@@ -45,9 +50,12 @@ const KNOWLEDGE_BASES = [
 ] as const;
 
 type KnowledgeBaseId = typeof KNOWLEDGE_BASES[number]['id'];
-
-// Derived array for use with z.enum() - automatically stays in sync with KNOWLEDGE_BASES
 const KNOWLEDGE_BASE_IDS = KNOWLEDGE_BASES.map(kb => kb.id) as unknown as [KnowledgeBaseId, ...KnowledgeBaseId[]];
+
+// Create a lookup map for O(1) access instead of O(n) find() calls
+const KNOWLEDGE_BASE_MAP = new Map<KnowledgeBaseId, typeof KNOWLEDGE_BASES[number]>(
+  KNOWLEDGE_BASES.map(kb => [kb.id, kb])
+);
 
 interface Document {
   name: string;
@@ -58,501 +66,318 @@ interface Document {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DOCUMENT CACHE & DISCOVERY
+// GITHUB API TYPES
 // ═══════════════════════════════════════════════════════════════════════════
 
-interface CacheEntry {
-  documents: Document[];
-  timestamp: number;
+interface GitHubTreeItem {
+  path: string;
+  mode: string;
+  type: 'blob' | 'tree';
+  sha: string;
+  size?: number;
+  url: string;
 }
 
-const documentCache = new Map<KnowledgeBaseId, CacheEntry>();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-let isInitialized = false;
+interface GitHubTreeResponse {
+  sha: string;
+  url: string;
+  tree: GitHubTreeItem[];
+  truncated: boolean;
+}
 
-// Convert "merchant-enlil-bani" → "Merchant Enlil Bani"
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Formats a slug string into a title case string.
+ * @example formatTitle('hello-world') => 'Hello World'
+ */
 function formatTitle(slug: string): string {
-  return slug
-    .split('-')
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ');
+  return slug.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
 }
 
-// Fetch document list from GitHub API for a single repository (supports nested directories)
-async function fetchDocumentsFromRepo(knowledgeBase: typeof KNOWLEDGE_BASES[number]): Promise<Document[]> {
-  const cached = documentCache.get(knowledgeBase.id);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    return cached.documents;
-  }
+/**
+ * Normalizes a path by removing leading './' and trailing slashes.
+ * @param path - The path to normalize
+ * @returns The normalized path without leading './' or trailing '/'
+ */
+function normalizePath(path: string): string {
+  return path.replace(/^\.\//, '').replace(/\/$/, '');
+}
 
+/**
+ * Creates GitHub API headers with optional authentication.
+ */
+function createGitHubHeaders(): HeadersInit {
   const headers: HeadersInit = {
-    'Accept': 'application/vnd.github.v3+json',
-    'User-Agent': 'MCP-Knowledge-Server',
+    Accept: GITHUB_API_VERSION,
+    'User-Agent': USER_AGENT,
   };
   
   if (GITHUB_TOKEN) {
-    headers['Authorization'] = `Bearer ${GITHUB_TOKEN}`;
+    headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
   }
+  
+  return headers;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DOCUMENT FETCHING
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fetches all markdown documents from a GitHub repository for a given knowledge base.
+ * @param knowledgeBase - The knowledge base configuration
+ * @returns Array of documents found in the repository
+ */
+async function fetchDocumentsFromRepo(knowledgeBase: typeof KNOWLEDGE_BASES[number]): Promise<Document[]> {
+  const headers = createGitHubHeaders();
+  const treeUrl = `${GITHUB_API_BASE}/repos/${knowledgeBase.owner}/${knowledgeBase.repo}/git/trees/${knowledgeBase.branch}?recursive=1`;
 
   try {
-    // Use Git Trees API with recursive=1 to get ALL files in the repo/directory
-    const treeUrl = `https://api.github.com/repos/${knowledgeBase.owner}/${knowledgeBase.repo}/git/trees/${knowledgeBase.branch}?recursive=1`;
     const response = await fetch(treeUrl, { headers });
     
     if (!response.ok) {
-      console.error(`GitHub API error for ${knowledgeBase.repo}: ${response.status}`);
-      // Return cached even if stale
-      if (cached) return cached.documents;
+      console.error(`Failed to fetch documents from ${knowledgeBase.id}: ${response.status} ${response.statusText}`);
       return [];
     }
 
-    const tree = await response.json();
+    const tree = await response.json() as GitHubTreeResponse;
+    const scopePath = normalizePath(knowledgeBase.path || './');
     
-    // Normalize the path scope (handle ./ for root, remove leading ./ and trailing /)
-    const rawPath = (knowledgeBase.path || './').replace(/^\.\//, '').replace(/\/$/, '');
-    const scopePath = rawPath; // Empty string means root
-    
-    const documents: Document[] = tree.tree
-      .filter((f: any) => {
-        // Must be a file (blob) and end with .md
-        if (f.type !== 'blob' || !f.path.endsWith('.md')) return false;
-        
-        // If no scope path, include all markdown files
+    return tree.tree
+      .filter((item): item is GitHubTreeItem => {
+        if (item.type !== 'blob' || !item.path.endsWith(MARKDOWN_EXTENSION)) {
+          return false;
+        }
         if (!scopePath) return true;
-        
-        // Must be within the scoped directory
-        return f.path.startsWith(scopePath + '/');
+        return item.path.startsWith(`${scopePath}/`);
       })
-      .map((f: any) => {
-        // Get the relative path within the scope (or full path if no scope)
-        const relativePath = scopePath 
-          ? f.path.slice(scopePath.length + 1) // +1 for the trailing slash
-          : f.path;
-        
-        // Document name is the path without .md extension (preserves nested structure)
-        const name = relativePath.replace('.md', '');
-        
-        // Title is derived from the filename (last part of path)
-        const fileName = relativePath.split('/').pop()!.replace('.md', '');
+      .map((item) => {
+        const relativePath = scopePath ? item.path.slice(scopePath.length + 1) : item.path;
+        const name = relativePath.replace(MARKDOWN_EXTENSION, '');
+        const fileNameParts = relativePath.split('/');
+        const fileName = fileNameParts[fileNameParts.length - 1]?.replace(MARKDOWN_EXTENSION, '') ?? name;
         
         return {
           name,
           title: formatTitle(fileName),
           description: `${knowledgeBase.name}: ${formatTitle(fileName)}`,
-          path: f.path, // Full path in repo for fetching content
+          path: item.path,
           knowledgeBase: knowledgeBase.id,
         };
       });
-
-    documentCache.set(knowledgeBase.id, {
-      documents,
-      timestamp: Date.now(),
-    });
-
-    return documents;
   } catch (error) {
-    console.error(`Failed to fetch from ${knowledgeBase.repo}:`, error);
-    if (cached) return cached.documents;
+    console.error(`Error fetching documents from ${knowledgeBase.id}:`, error);
     return [];
   }
 }
 
-// Fetch documents from all repositories
 async function fetchAllDocuments(): Promise<Document[]> {
-  const results = await Promise.all(
-    KNOWLEDGE_BASES.map(kb => fetchDocumentsFromRepo(kb))
-  );
+  const results = await Promise.all(KNOWLEDGE_BASES.map(kb => fetchDocumentsFromRepo(kb)));
   return results.flat();
 }
 
-// Get documents for a specific knowledge base
+/**
+ * Gets documents from a specific knowledge base or all knowledge bases.
+ * @param knowledgeBaseId - Optional knowledge base ID to filter by
+ * @returns Array of documents
+ */
 async function getDocuments(knowledgeBaseId?: KnowledgeBaseId): Promise<Document[]> {
   if (knowledgeBaseId) {
-    const kb = KNOWLEDGE_BASES.find(k => k.id === knowledgeBaseId);
-    if (!kb) return [];
+    const kb = KNOWLEDGE_BASE_MAP.get(knowledgeBaseId);
+    if (!kb) {
+      console.warn(`Unknown knowledge base ID: ${knowledgeBaseId}`);
+      return [];
+    }
     return fetchDocumentsFromRepo(kb);
   }
   return fetchAllDocuments();
 }
 
-// Fetch actual document content from GitHub raw URLs (no rate limit!)
+/**
+ * Fetches the raw content of a specific document from a knowledge base.
+ * @param knowledgeBaseId - The knowledge base ID
+ * @param documentName - The document name (without .md extension)
+ * @returns The document content as a string
+ * @throws Error if the knowledge base is unknown or document is not found
+ */
 async function fetchDocumentContent(knowledgeBaseId: KnowledgeBaseId, documentName: string): Promise<string> {
-  const kb = KNOWLEDGE_BASES.find(k => k.id === knowledgeBaseId);
-  if (!kb) throw new Error(`Unknown knowledge base: ${knowledgeBaseId}`);
-  
-  // Construct the full path: scope path + document name + .md extension
-  // Handle ./ for root, remove leading ./ and trailing /
-  const scopePath = (kb.path || './').replace(/^\.\//, '').replace(/\/$/, '');
-  const fullPath = scopePath 
-    ? `${scopePath}/${documentName}.md`
-    : `${documentName}.md`;
-  
-  const url = `https://raw.githubusercontent.com/${kb.owner}/${kb.repo}/${kb.branch}/${fullPath}`;
-  const response = await fetch(url);
-  
-  if (!response.ok) {
-    throw new Error(`Document not found: ${documentName} in ${kb.repo}`);
+  const kb = KNOWLEDGE_BASE_MAP.get(knowledgeBaseId);
+  if (!kb) {
+    throw new Error(`Unknown knowledge base: ${knowledgeBaseId}`);
   }
   
-  return response.text();
-}
-
-// Initialize: Scan all repositories on startup
-async function initializeKnowledgeBase(): Promise<void> {
-  if (isInitialized) return;
+  const scopePath = normalizePath(kb.path || './');
+  const fullPath = scopePath ? `${scopePath}/${documentName}${MARKDOWN_EXTENSION}` : `${documentName}${MARKDOWN_EXTENSION}`;
+  const url = `${GITHUB_RAW_BASE}/${kb.owner}/${kb.repo}/${kb.branch}/${fullPath}`;
   
-  console.log('🔍 Initializing MCP Knowledge Server...');
-  console.log(`📚 Scanning ${KNOWLEDGE_BASES.length} knowledge base repositories...`);
-  
-  const startTime = Date.now();
-  const allDocs = await fetchAllDocuments();
-  
-  console.log(`✅ Found ${allDocs.length} documents across all repositories in ${Date.now() - startTime}ms`);
-  
-  for (const kb of KNOWLEDGE_BASES) {
-    const docs = documentCache.get(kb.id);
-    console.log(`   - ${kb.name}: ${docs?.documents.length ?? 0} documents`);
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Document not found: ${documentName} (${response.status} ${response.statusText})`);
+    }
+    return response.text();
+  } catch (error) {
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error(`Failed to fetch document: ${documentName}`);
   }
-  
-  isInitialized = true;
 }
 
-// Create a new MCP server instance
-async function createServer() {
-  // Initialize knowledge base on server creation (scan GitHub repos)
-  await initializeKnowledgeBase();
-  
+// ═══════════════════════════════════════════════════════════════════════════
+// MCP SERVER SETUP (Stateless - works on Railway/Vercel/anywhere)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Creates and configures the MCP server with all tools.
+ */
+function createServer(): McpServer {
   const server = new McpServer({
-    name: 'knowledge-base-mcp',
+    name: 'acornio-mcp',
     version: '1.0.0',
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // RESOURCES: Knowledge Base Discovery
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  // Resource: List all knowledge bases
-  server.registerResource(
-    'knowledge-bases',
-    'kb://sources',
-    {
-      description: 'List of all available knowledge base sources (GitHub repositories)',
-      mimeType: 'application/json',
-    },
-    async () => ({
-      contents: [{
-        uri: 'kb://sources',
-        mimeType: 'application/json',
-        text: JSON.stringify(KNOWLEDGE_BASES.map(kb => ({
-          id: kb.id,
-          name: kb.name,
-          description: kb.description,
-          repository: `${kb.owner}/${kb.repo}`,
-        })), null, 2),
-      }],
-    }),
-  );
-
-  // Resource: List ALL documents from all knowledge bases
-  server.registerResource(
-    'all-documents',
-    'kb://documents',
-    {
-      description: 'List of all documents across all knowledge bases (auto-discovered from GitHub)',
-      mimeType: 'application/json',
-    },
-    async () => {
-      const documents = await fetchAllDocuments();
-      return {
-        contents: [{
-          uri: 'kb://documents',
-          mimeType: 'application/json',
-          text: JSON.stringify(documents, null, 2),
-        }],
-      };
-    },
-  );
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // RESOURCES: Per-Knowledge-Base Documents
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  // Register resources for each knowledge base
-  for (const kb of KNOWLEDGE_BASES) {
-    // Resource: List documents in this knowledge base
-    server.registerResource(
-      `${kb.id}-documents`,
-      `kb://${kb.id}/documents`,
-      {
-        description: `List of documents in ${kb.name} (auto-discovered from GitHub)`,
-        mimeType: 'application/json',
-      },
-      async () => {
-        const documents = await getDocuments(kb.id);
-        return {
-          contents: [{
-            uri: `kb://${kb.id}/documents`,
-            mimeType: 'application/json',
-            text: JSON.stringify(documents, null, 2),
-          }],
-        };
-      },
-    );
-
-    // Resource Template: Read individual documents from this knowledge base
-    server.registerResource(
-      `${kb.id}-document`,
-      new ResourceTemplate(`kb://${kb.id}/documents/{documentName}`, {
-        list: async () => {
-          const documents = await getDocuments(kb.id);
-          return {
-            resources: documents.map((doc) => ({
-              uri: `kb://${kb.id}/documents/${doc.name}`,
-              name: doc.title,
-              description: doc.description,
-              mimeType: 'text/markdown',
-            })),
-          };
-        },
-        complete: {
-          documentName: async () => {
-            const documents = await getDocuments(kb.id);
-            return documents.map((d) => d.name);
-          },
-        },
-      }),
-      {
-        description: `Individual document from ${kb.name}`,
-        mimeType: 'text/markdown',
-      },
-      async (uri, { documentName }) => {
-        const content = await fetchDocumentContent(kb.id, documentName as string);
-        return {
-          contents: [{
-            uri: uri.href,
-            mimeType: 'text/markdown',
-            text: content,
-          }],
-        };
-      },
-    );
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // TOOLS: Knowledge Base Operations
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  // Tool: Search across all documents
   server.registerTool(
     'searchDocuments',
     {
-      description: 'Search for documents by name across all knowledge bases. Returns matching document metadata.',
-      inputSchema: {
-        query: z.string().describe('Search query to match against document names'),
-        knowledgeBase: z.enum(KNOWLEDGE_BASE_IDS).optional().describe('Optional: limit search to specific knowledge base'),
+      description: 'Search for documents by name across all knowledge bases',
+      inputSchema: { 
+        query: z.string().describe('Search query'),
+        knowledgeBase: z.enum(KNOWLEDGE_BASE_IDS).optional().describe('Limit to specific knowledge base'),
       },
     },
     async ({ query, knowledgeBase }) => {
-      const documents = await getDocuments(knowledgeBase as KnowledgeBaseId | undefined);
-      const q = (query as string).toLowerCase();
-      
+      const documents = await getDocuments(knowledgeBase);
+      const queryLower = query.toLowerCase();
       const matches = documents.filter(doc => 
-        doc.name.toLowerCase().includes(q) || 
-        doc.title.toLowerCase().includes(q)
+        doc.name.toLowerCase().includes(queryLower) || doc.title.toLowerCase().includes(queryLower)
       );
-
+      
+      const resultText = matches.length > 0
+        ? `Found ${matches.length} document(s):\n${matches.map(d => `- ${d.title} (${d.knowledgeBase}/${d.name})`).join('\n')}`
+        : 'No documents found.';
+      
       return {
         content: [{
           type: 'text',
-          text: matches.length > 0
-            ? `Found ${matches.length} document(s):\n${matches.map(d => `- ${d.title} (${d.knowledgeBase}/${d.name})`).join('\n')}`
-            : 'No documents found matching your query.',
+          text: resultText,
         }],
       };
     },
   );
 
-  // Tool: Get document content
   server.registerTool(
     'getDocument',
     {
-      description: 'Retrieve the full content of a specific document from a knowledge base.',
+      description: 'Get the full content of a document',
       inputSchema: {
-        knowledgeBase: z.enum(KNOWLEDGE_BASE_IDS).describe('The knowledge base to read from'),
-        documentName: z.string().describe('The document name (without .md extension)'),
+        knowledgeBase: z.enum(KNOWLEDGE_BASE_IDS).describe('Knowledge base ID'),
+        documentName: z.string().describe('Document name (without .md)'),
       },
     },
     async ({ knowledgeBase, documentName }) => {
       try {
-        const content = await fetchDocumentContent(knowledgeBase as KnowledgeBaseId, documentName as string);
-        return {
-          content: [{ type: 'text', text: content }],
-        };
+        const content = await fetchDocumentContent(knowledgeBase, documentName);
+        return { content: [{ type: 'text', text: content }] };
       } catch (error) {
-        return {
-          content: [{ type: 'text', text: `Error: ${(error as Error).message}` }],
-          isError: true,
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+        console.error(`Error fetching document ${documentName} from ${knowledgeBase}:`, error);
+        return { 
+          content: [{ type: 'text', text: `Error: ${errorMessage}` }], 
+          isError: true 
         };
       }
     },
   );
 
-  // Tool: List available knowledge bases
   server.registerTool(
     'listKnowledgeBases',
     {
-      description: 'List all available knowledge base sources and their document counts.',
+      description: 'List all knowledge bases and their document counts',
       inputSchema: {},
     },
     async () => {
       const results = await Promise.all(
         KNOWLEDGE_BASES.map(async (kb) => {
           const docs = await getDocuments(kb.id);
-          return `📚 ${kb.name} (${kb.id})\n   Repository: ${kb.owner}/${kb.repo}\n   Documents: ${docs.length}`;
+          return `📚 ${kb.name} (${kb.id}) - ${docs.length} documents`;
         })
       );
-
-      return {
-        content: [{
-          type: 'text',
-          text: `Available Knowledge Bases:\n\n${results.join('\n\n')}`,
-        }],
-      };
+      return { content: [{ type: 'text', text: results.join('\n') }] };
     },
   );
 
-  // Tool: Refresh document cache
   server.registerTool(
-    'refreshDocuments',
+    'listDocuments',
     {
-      description: 'Force refresh the document cache by re-scanning GitHub repositories.',
-      inputSchema: {},
+      description: 'List all documents in a knowledge base',
+      inputSchema: { knowledgeBase: z.enum(KNOWLEDGE_BASE_IDS).optional() },
     },
-    async () => {
-      documentCache.clear();
-      isInitialized = false;
+    async ({ knowledgeBase }) => {
+      const documents = await getDocuments(knowledgeBase as KnowledgeBaseId | undefined);
+      if (documents.length === 0) return { content: [{ type: 'text', text: 'No documents found.' }] };
       
-      const startTime = Date.now();
-      await initializeKnowledgeBase();
-      
-      const allDocs = await fetchAllDocuments();
-      
-      return {
-        content: [{
-          type: 'text',
-          text: `✅ Refreshed document cache in ${Date.now() - startTime}ms\nFound ${allDocs.length} documents across ${KNOWLEDGE_BASES.length} knowledge bases.`,
-        }],
-      };
+      const grouped = documents.reduce((acc, doc) => {
+        if (!acc[doc.knowledgeBase]) acc[doc.knowledgeBase] = [];
+        acc[doc.knowledgeBase].push(doc);
+        return acc;
+      }, {} as Record<string, Document[]>);
+
+      const output = Object.entries(grouped)
+        .map(([kbId, docs]) => {
+          const kb = KNOWLEDGE_BASE_MAP.get(kbId as KnowledgeBaseId);
+          return `📚 ${kb?.name || kbId}:\n${docs.map(d => `   - ${d.title} (${d.name})`).join('\n')}`;
+        })
+        .join('\n\n');
+
+      return { content: [{ type: 'text', text: output }] };
     },
   );
 
   return server;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// HTTP HANDLERS - Stateless mode (no session management needed)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Create a single stateless transport and server
+const transport = new StreamableHTTPServerTransport({
+  sessionIdGenerator: undefined, // Stateless mode
+});
+const server = createServer();
+let isConnected = false;
+
+/**
+ * Ensures the server is connected to the transport.
+ * This is safe to call multiple times as it only connects once.
+ */
+async function ensureConnected(): Promise<void> {
+  if (!isConnected) {
+    await server.connect(transport);
+    isConnected = true;
+    console.log('🚀 MCP Knowledge Server connected');
+  }
+}
+
 export async function POST(request: Request) {
-  // Check for existing session
-  const sessionId = request.headers.get('mcp-session-id');
-  let transport: WebStandardStreamableHTTPServerTransport;
-  let server: McpServer;
-
-  if (sessionId && transports.has(sessionId) && servers.has(sessionId)) {
-    // Reuse existing transport and server for this session
-    transport = transports.get(sessionId)!;
-    server = servers.get(sessionId)!;
-    
-    // In serverless environments, the server connection might be lost even if both exist in memory
-    // Always reconnect to ensure the server is properly initialized
-    // This is safe - connecting an already-connected server should be handled gracefully
-    try {
-      await server.connect(transport);
-      // Handle the request with the reconnected server
-      return await transport.handleRequest(request);
-    } catch (error) {
-      // If reconnection fails, create fresh transport/server
-      console.log(`[${sessionId}] Failed to reconnect server, creating new connection:`, error);
-      // Fall through to create new connection
-    }
-  }
-
-  // Create new transport/server connection
-  // This happens if:
-  // 1. No existing session
-  // 2. Transport or server not found (common in serverless after instance restart)
-  // 3. Reconnection failed
-  if (sessionId) {
-    // Clean up old entries if they exist
-    transports.delete(sessionId);
-    servers.delete(sessionId);
-  }
-
-  // Create new transport for new session or reconnection
-  // Use provided sessionId if available, otherwise let transport generate one
-  let capturedSessionId: string | null = null;
-  transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: () => sessionId || crypto.randomUUID(),
-    onsessioninitialized: (id) => {
-      capturedSessionId = id;
-      transports.set(id, transport);
-    },
-  });
-
-  // Create and connect the MCP server to the transport
-  server = await createServer();
-  await server.connect(transport);
-  
-  // Store server for this session
-  // Use the captured session ID from callback, or fall back to provided sessionId
-  const finalSessionId = capturedSessionId || sessionId;
-  if (finalSessionId) {
-    servers.set(finalSessionId, server);
-    // Also ensure transport is stored with this ID
-    if (!transports.has(finalSessionId)) {
-      transports.set(finalSessionId, transport);
-    }
-  }
-
-  // Handle the request with the new transport
-  return transport.handleRequest(request);
+  await ensureConnected();
+  const { req, res } = toReqRes(request);
+  await transport.handleRequest(req, res);
+  return toFetchResponse(res);
 }
 
 export async function GET(request: Request) {
-  const sessionId = request.headers.get('mcp-session-id');
-
-  if (!sessionId || !transports.has(sessionId) || !servers.has(sessionId)) {
-    return new Response('Session not found', { status: 404 });
-  }
-
-  const transport = transports.get(sessionId)!;
-  const server = servers.get(sessionId)!;
-  
-  // Ensure server is connected
-  try {
-    return await transport.handleRequest(request);
-  } catch (error) {
-    // If connection is lost, return error
-    console.error(`[${sessionId}] GET request failed:`, error);
-    return new Response('Session connection lost', { status: 500 });
-  }
+  await ensureConnected();
+  const { req, res } = toReqRes(request);
+  await transport.handleRequest(req, res);
+  return toFetchResponse(res);
 }
 
-export async function DELETE(request: Request) {
-  const sessionId = request.headers.get('mcp-session-id');
-
-  if (sessionId) {
-    if (transports.has(sessionId)) {
-      const transport = transports.get(sessionId)!;
-      try {
-        await transport.close();
-      } catch (error) {
-        console.error(`[${sessionId}] Error closing transport:`, error);
-      }
-      transports.delete(sessionId);
-    }
-    if (servers.has(sessionId)) {
-      servers.delete(sessionId);
-    }
-  }
-
+export async function DELETE() {
   return new Response(null, { status: 204 });
 }
 

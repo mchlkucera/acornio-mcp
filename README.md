@@ -1,113 +1,122 @@
-# Random Knowledge MCP
+# Acornio MCP Server
 
-An MCP (Model Context Protocol) server deployed on Vercel that provides tools for exploring a knowledge base.
+A Model Context Protocol (MCP) server that provides access to knowledge base documents from GitHub repositories.
 
 ## Features
 
-- **sayHello** - A friendly greeting from the MCP server
-- **listMesopotamiaDocuments** - List all markdown documents in the knowledge base
-- **readMesopotamiaDocument** - Read specific documents
-- **searchMesopotamiaDocuments** - Search across all documents for topics, people, places, or events
-- **openMesopotamiaMap** - Get the URL for an interactive map
+- **4 Tools**: `listKnowledgeBases`, `listDocuments`, `searchDocuments`, `getDocument`
+- **Multiple Knowledge Bases**: Supports multiple GitHub repositories as knowledge sources
+- **Auto-discovery**: Automatically discovers markdown documents in configured repositories
+- **Stateless**: Works on any hosting platform (Railway, Vercel, etc.)
 
-## Setup
+## Deployment
 
-### 1. Configure the Knowledge Base
+This is a Next.js application that can be deployed to any platform that supports Next.js.
 
-Update the repository configuration in `app/api/mcp/route.ts`:
+### Quick Deploy Options
+
+- **Vercel**: Connect your GitHub repo and deploy with one click
+- **Railway**: Connect your repo and Railway auto-detects Next.js
+- **Netlify**: Connect your repo and configure build command: `npm run build`
+- **Fly.io**: Use the Next.js template
+- **Any Node.js host**: Run `npm run build && npm start`
+
+### Deployment Steps
+
+1. Push your code to GitHub
+2. Connect your repository to your chosen hosting platform
+3. Add environment variable: `GITHUB_TOKEN` (optional, for higher API rate limits)
+4. Deploy! The platform should auto-detect Next.js and configure accordingly
+
+### Platform-Specific Notes
+
+- **Vercel**: Zero configuration needed, just connect and deploy
+- **Railway**: Auto-detects Next.js, no additional config required
+- **Netlify**: May need to set build command: `npm run build` and publish directory: `.next`
+- **Self-hosted**: Ensure Node.js 18+ is installed and set `NODE_ENV=production`
+
+## Configuration
+
+Edit `app/api/[transport]/route.ts` to configure your knowledge bases:
 
 ```typescript
-const MESOPOTAMIA_REPO = 'your-username/random-knowledge-base';
-const MESOPOTAMIA_BRANCH = 'main';
+const KNOWLEDGE_BASES = [
+  {
+    id: 'vision',
+    name: 'My Knowledge Base',
+    description: 'Description of knowledge base',
+    owner: 'github-username',
+    repo: 'repo-name',
+    branch: 'main',
+    path: './docs', // path to markdown files
+  },
+  // Add more...
+];
 ```
 
-Replace with your actual GitHub repository containing markdown documents.
+## Environment Variables
 
-### 2. Install Dependencies
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `GITHUB_TOKEN` | GitHub personal access token for higher API rate limits (60/hr → 5000/hr) | No |
+
+## Connect to MCP Client
+
+### Cursor / Claude Desktop
+
+Add to your MCP config (replace `https://your-app.example.com` with your deployed URL):
+
+```json
+{
+  "mcpServers": {
+    "acornio-knowledge": {
+      "url": "https://your-app.example.com/api/mcp"
+    }
+  }
+}
+```
+
+Or use mcp-remote for stdio transport:
+
+```json
+{
+  "mcpServers": {
+    "acornio-knowledge": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://your-app.example.com/api/mcp"]
+    }
+  }
+}
+```
+
+**Note**: Replace `your-app.example.com` with your actual deployment URL:
+- Vercel: `your-app.vercel.app`
+- Railway: `your-app.railway.app`
+- Netlify: `your-app.netlify.app`
+- Custom domain: `your-domain.com`
+
+## Local Development
 
 ```bash
 npm install
-```
-
-### 3. Run Locally
-
-```bash
 npm run dev
 ```
 
-The server will start at `http://localhost:3000`.
+Server runs at `http://localhost:3000/api/mcp`
 
-### 4. Test with MCP Inspector
+## Available Tools
 
-```bash
-npx @modelcontextprotocol/inspector@latest http://localhost:3000
-```
+### `listKnowledgeBases`
+Lists all configured knowledge bases and their document counts.
 
-Then:
-1. Open http://127.0.0.1:6274
-2. Select "Streamable HTTP" transport
-3. Enter URL: `http://localhost:3000/api/mcp`
-4. Click Connect
-5. Test the tools under "List Tools"
+### `listDocuments`
+Lists all documents, optionally filtered by knowledge base.
 
-## Deploy to Vercel
+### `searchDocuments`
+Searches for documents by name/title across knowledge bases.
 
-### One-Click Deploy
-
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/your-username/random-knowledge-mcp)
-
-### Manual Deploy
-
-1. Push this repository to GitHub
-2. Import the project in Vercel Dashboard
-3. Deploy!
-
-Your MCP server will be available at `https://your-project.vercel.app/api/mcp`
-
-## Configure MCP Clients
-
-### Cursor
-
-Add to `.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "random-knowledge": {
-      "url": "https://your-project.vercel.app/api/mcp"
-    }
-  }
-}
-```
-
-### Claude Desktop
-
-Add to your Claude Desktop MCP configuration:
-
-```json
-{
-  "mcpServers": {
-    "random-knowledge": {
-      "transport": {
-        "type": "streamable-http",
-        "url": "https://your-project.vercel.app/api/mcp"
-      }
-    }
-  }
-}
-```
-
-## Knowledge Base Format
-
-The knowledge base should be a GitHub repository with markdown files. Each `.md` file represents a document that can be listed, read, and searched.
-
-## Tech Stack
-
-- **Framework**: Next.js 15
-- **MCP Handler**: mcp-handler
-- **Validation**: Zod
-- **Deployment**: Vercel
-- **Transport**: Streamable HTTP
+### `getDocument`
+Retrieves the full content of a specific document.
 
 ## License
 
