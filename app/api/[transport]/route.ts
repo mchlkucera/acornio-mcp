@@ -14,6 +14,7 @@ const USER_AGENT = 'MCP-Knowledge-Server';
 const MARKDOWN_EXTENSION = '.md';
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // KNOWLEDGE BASE CONFIGURATION
@@ -120,6 +121,30 @@ function createGitHubHeaders(): HeadersInit {
   }
   
   return headers;
+}
+
+/**
+ * Validates the authentication token from the request.
+ * @param request - The incoming HTTP request
+ * @returns true if authentication is valid or not required, false otherwise
+ */
+function validateAuth(request: Request): boolean {
+  // If no MCP_AUTH_TOKEN is configured, allow all requests
+  if (!MCP_AUTH_TOKEN) {
+    return true;
+  }
+  
+  const authHeader = request.headers.get('authorization');
+  if (!authHeader) {
+    return false;
+  }
+  
+  // Support both "Bearer <token>" and just "<token>" formats
+  const token = authHeader.startsWith('Bearer ') 
+    ? authHeader.slice(7) 
+    : authHeader;
+  
+  return token === MCP_AUTH_TOKEN;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -364,6 +389,21 @@ async function ensureConnected(): Promise<void> {
 }
 
 export async function POST(request: Request) {
+  // Validate authentication
+  if (!validateAuth(request)) {
+    return new Response(JSON.stringify({
+      jsonrpc: '2.0',
+      error: { 
+        code: -32001, 
+        message: 'Unauthorized: Invalid or missing authentication token' 
+      },
+      id: null,
+    }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  
   await ensureConnected();
   const { req, res } = toReqRes(request);
   await transport.handleRequest(req, res);
@@ -393,7 +433,7 @@ export async function OPTIONS() {
     headers: {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, mcp-session-id, mcp-protocol-version',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, mcp-session-id, mcp-protocol-version',
     },
   });
 }

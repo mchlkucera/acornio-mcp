@@ -25,7 +25,9 @@ This is a Next.js application that can be deployed to any platform that supports
 
 1. Push your code to GitHub
 2. Connect your repository to your chosen hosting platform
-3. Add environment variable: `GITHUB_TOKEN` (optional, for higher API rate limits)
+3. Add environment variables:
+   - `GITHUB_TOKEN` (optional, for higher API rate limits)
+   - `MCP_AUTH_TOKEN` (optional, for securing access to your MCP server)
 4. Deploy! The platform should auto-detect Next.js and configure accordingly
 
 ### Platform-Specific Notes
@@ -54,11 +56,35 @@ const KNOWLEDGE_BASES = [
 ];
 ```
 
+## Security & Authentication
+
+This MCP server supports optional token-based authentication to secure access to your knowledge bases.
+
+### How It Works
+
+- When `MCP_AUTH_TOKEN` is not set, the server accepts all requests (useful for local development or private networks)
+- When `MCP_AUTH_TOKEN` is set, clients must provide this token in the `Authorization` header
+- The server accepts both `Bearer <token>` and `<token>` formats
+
+### Setting Up Authentication
+
+1. Generate a secure random token (e.g., `openssl rand -hex 32`)
+2. Set the `MCP_AUTH_TOKEN` environment variable on your hosting platform
+3. Configure your MCP client with the same token (see examples below)
+
+### Best Practices
+
+- Use a strong, randomly-generated token (at least 32 characters)
+- Keep your token secret and never commit it to version control
+- Rotate your token periodically
+- Use HTTPS for all production deployments to protect the token in transit
+
 ## Environment Variables
 
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `GITHUB_TOKEN` | GitHub personal access token for higher API rate limits (60/hr → 5000/hr) | No |
+| `MCP_AUTH_TOKEN` | Authentication token for securing MCP server access. When set, clients must provide this token in the Authorization header. | No |
 
 ## Connect to MCP Client
 
@@ -76,6 +102,21 @@ Add to your MCP config (replace `https://your-app.example.com` with your deploye
 }
 ```
 
+If you've configured `MCP_AUTH_TOKEN`, add authentication:
+
+```json
+{
+  "mcpServers": {
+    "acornio-knowledge": {
+      "url": "https://your-app.example.com/api/mcp",
+      "headers": {
+        "Authorization": "Bearer your_token_here"
+      }
+    }
+  }
+}
+```
+
 Or use mcp-remote for stdio transport:
 
 ```json
@@ -84,6 +125,19 @@ Or use mcp-remote for stdio transport:
     "acornio-knowledge": {
       "command": "npx",
       "args": ["-y", "mcp-remote", "https://your-app.example.com/api/mcp"]
+    }
+  }
+}
+```
+
+With authentication:
+
+```json
+{
+  "mcpServers": {
+    "acornio-knowledge": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "--header", "Authorization: Bearer your_token_here", "https://your-app.example.com/api/mcp"]
     }
   }
 }
