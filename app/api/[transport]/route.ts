@@ -48,6 +48,15 @@ const KNOWLEDGE_BASES = [
     branch: 'main',
     path: './processes',
   },
+  {
+    id: 'reservio',
+    name: 'Reservio knowledge',
+    description: 'Reservio knowledge base',
+    owner: 'reservio',
+    repo: 'knowledge',
+    branch: 'main',
+    path: './reservio',
+  },
 ] as const;
 
 type KnowledgeBaseId = typeof KNOWLEDGE_BASES[number]['id'];
